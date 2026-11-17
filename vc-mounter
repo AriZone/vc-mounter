@@ -1,0 +1,1148 @@
+#!/usr/bin/python3
+# SPDX-License-Identifier: ISC
+# Copyright (c) 2026 AriZone <github@arizone.eu>
+"""
+vc-mounter — VeraCrypt volume mounter with stable device identification.
+
+Solves the /dev/sdb1-today-/dev/sde1-tomorrow problem: volumes are stored
+in the config as /dev/disk/by-id/... paths (serial-number based, stable
+across reboots and port changes) and resolved to the current /dev/sdXY
+at mount time.
+
+Security design:
+  * Password and PIM entries use GtkPasswordEntryBuffer, which keeps the
+    typed text in non-pageable (mlock'ed) memory where the platform allows
+    and zeroes it on free; input-method caching/prediction is disabled.
+  * The process is marked non-dumpable at startup: no core dumps, and no
+    other process of the same user can read its memory (ptrace,
+    /proc/PID/mem).
+  * Limitation: to hand the password to the helper it has to pass through
+    ordinary Python objects, which cannot be wiped. They live until the
+    interpreter reuses that memory, so keep swap encrypted.
+  * Everything that runs as root lives in a separate, root-owned helper
+    (/usr/libexec/vc-mounter/vc-mounter-helper, installed by install.sh)
+    with its own polkit action. This file runs entirely as the desktop
+    user and contains no root code.
+  * The password, PIM and KDF are sent to that helper once, over
+    stdin only — never via pkexec's argv, the environment, or any file.
+  * The helper answers VeraCrypt's own password and PIM prompts on stdin,
+    so neither appears on any command line. A KDF chosen explicitly is
+    passed as --hash=NAME and stays visible in the process list while the
+    volume is mounted; "Autodetect" passes nothing.
+  * One pkexec authentication mounts all checked volumes, in parallel.
+  * Both entries are cleared and the KDF choice is reset after a fully
+    successful mount, whenever the window is hidden to the tray, and on
+    quit.
+  * Nothing sensitive is written to the config file (device IDs only,
+    file created 0600 in a 0700 directory).
+
+Mapping tab:
+  * "Mount all configured volumes" mounts everything connected and not yet
+    mounted; "Dismount all" dismounts every VeraCrypt volume on the system.
+  * A single volume is dismounted with the eject button at the end of its
+    row, or by right-clicking the row. The right-click menu also offers
+    "Force dismount…" once a normal dismount found the volume busy.
+
+Tray / lifecycle:
+  * Closing the window hides the app to a tray indicator (padlock icon;
+    open padlock while volumes are mounted). Minimize behaves normally.
+  * Tray menu: Show/hide, Mount volumes…, Dismount all, Quit.
+  * "Start at login" checkbox (Config tab) installs
+    ~/.config/autostart/vc-mounter.desktop launching with --hidden,
+    so the app waits in the tray after logon.
+  * The indicator is a small GTK3 AppIndicator program, vc-mounter-tray,
+    kept next to this file and run as a subprocess (GTK4 has no tray API;
+    GTK3+GTK4 cannot share a process). Requires:
+        sudo apt install gir1.2-ayatanaappindicator3-0.1
+    and GNOME's "Ubuntu AppIndicators" extension (enabled by default).
+    Without it the app still works; closing the window then quits.
+
+Requirements: Ubuntu with GTK4 + PyGObject (python3-gi, preinstalled on
+GNOME), VeraCrypt 1.26.30 or newer (veracrypt CLI in /usr/bin), polkit
+agent running (GNOME default), and the root helper installed once with
+`sudo ./install.sh`.
+
+Mount points: VeraCrypt defaults are used -> /media/veracrypt1..N.
+"""
+
+import ctypes
+import dataclasses
+import glob
+import json
+import os
+import re
+import resource
+import shutil
+import subprocess
+import sys
+import threading
+import time
+
+import gi
+gi.require_version("Gdk", "4.0")
+gi.require_version("Gtk", "4.0")
+from gi.repository import Gdk, GLib, Gtk, Pango  # noqa: E402
+
+__version__ = "0.9.0"
+PROJECT_URL = "https://github.com/AriZone/vc-mounter"
+
+CONFIG_DIR = os.path.expanduser("~/.config/vc-mounter")
+CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
+AUTOSTART_FILE = os.path.expanduser("~/.config/autostart/vc-mounter.desktop")
+
+ICON_LOCKED = "changes-prevent-symbolic"
+ICON_UNLOCKED = "changes-allow-symbolic"
+
+KDF_CHOICES = [
+    ("Autodetect", None),
+    ("SHA-512", "sha-512"),
+    ("SHA-256", "sha-256"),
+    ("Whirlpool", "whirlpool"),
+    ("BLAKE2s-256", "blake2s-256"),
+    ("Streebog", "streebog"),
+    ("Argon2id", "argon2id"),         # memory-hard KDF, VeraCrypt >= 1.26.29
+]
+KDF_TOOLTIP = ("Autodetect tries every KDF and hides which one the volume "
+               "uses. A KDF named here is passed to VeraCrypt as --hash=NAME "
+               "and is visible in the process list while the volume is "
+               "mounted.")
+
+# ---------------------------------------------------------------------------
+# Root-side helper: a separate, root-owned program installed by install.sh
+# and started through polkit (pkexec). This file contains no code that runs
+# as root. Protocol (see the helper's own header for details):
+#   mount:     stdin  = password \n PIM \n KDF \n, then "CANCEL" or EOF
+#              stdout = RESULT \t <device> \t OK|ERR|CANCELLED|SKIPPED \t <msg>
+#   dismount:  stdout = DISMOUNT \t <volume> \t OK|ERR|PENDING \t <msg>
+#                       \t <holders>
+# ---------------------------------------------------------------------------
+HELPER = "/usr/libexec/vc-mounter/vc-mounter-helper"
+
+# ---------------------------------------------------------------------------
+# Tray indicator: vc-mounter-tray, a small GTK3 program in the same folder
+# (GTK4 has no tray API and GTK3 + GTK4 cannot share a process). Protocol:
+#   tray -> app  (stdout):  TOGGLE | MOUNT | DISMOUNT | QUIT
+#   app -> tray  (stdin):   ICON <icon-name> | QUIT
+# It exits with code 3 if no AppIndicator library is available.
+# ---------------------------------------------------------------------------
+TRAY_SCRIPT = os.path.join(os.path.dirname(os.path.realpath(__file__)),
+                           "vc-mounter-tray")
+
+
+# ---------------------------------------------------------------------------
+# System inspection
+# ---------------------------------------------------------------------------
+def human_size(nbytes):
+    n = float(nbytes or 0)
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB", "PiB"):
+        if n < 1024 or unit == "PiB":
+            return f"{n:.1f} {unit}" if unit != "B" else f"{int(n)} B"
+        n /= 1024.0
+
+
+def list_partitions():
+    """All partitions in the system (whole disks intentionally skipped)."""
+    # Flat list (-l): lsblk only nests partitions under their disk when the
+    # NAME column is requested, so the disk model is looked up through
+    # PKNAME (the parent's kernel name) instead.
+    out = subprocess.run(
+        ["lsblk", "-J", "-b", "-l", "-o",
+         "KNAME,PKNAME,PATH,TYPE,SIZE,MODEL,FSTYPE"],
+        capture_output=True, text=True, check=True,
+    ).stdout
+    devices = json.loads(out).get("blockdevices", [])
+    models = {d.get("kname"): (d.get("model") or "").strip()
+              for d in devices}
+    parts = [{"path": d["path"],
+              "size": d.get("size") or 0,
+              "model": models.get(d.get("pkname"), ""),
+              "fstype": d.get("fstype") or ""}
+             for d in devices if d.get("type") == "part"]
+    parts.sort(key=lambda p: p["path"])
+    return parts
+
+
+def by_id_map():
+    """realpath -> preferred /dev/disk/by-id/... symlink."""
+    m = {}
+    for link in glob.glob("/dev/disk/by-id/*"):
+        m.setdefault(os.path.realpath(link), []).append(link)
+    best = {}
+    for real, links in m.items():
+        # Prefer human-readable ata-/usb-/nvme-<model>_<serial> names over
+        # wwn-/eui/dm- forms; all are equally stable.
+        links.sort(key=lambda l: (
+            os.path.basename(l).startswith(("wwn-", "nvme-eui.", "dm-")),
+            len(l),
+        ))
+        best[real] = links[0]
+    return best
+
+
+def load_config():
+    try:
+        with open(CONFIG_FILE, "r") as f:
+            data = json.load(f)
+        return [v for v in data.get("volumes", []) if isinstance(v, str)]
+    except (OSError, ValueError):
+        return []
+
+
+def save_config(volume_ids):
+    os.makedirs(CONFIG_DIR, mode=0o700, exist_ok=True)
+    tmp = CONFIG_FILE + ".tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        json.dump({"volumes": volume_ids}, f, indent=2)
+    os.replace(tmp, CONFIG_FILE)
+
+
+def _unescape_mount_field(s):
+    """Decode the \\ooo octal escapes used in /proc/mounts."""
+    return re.sub(r"\\([0-7]{3})", lambda m: chr(int(m.group(1), 8)), s)
+
+
+def mounted_veracrypt_devices():
+    """Real mount state, read without root.
+
+    Returns {"/dev/sdXY": mountpoint} for every partition that currently
+    backs an active VeraCrypt dm-crypt mapping (/dev/mapper/veracryptN).
+    mountpoint is "" if the mapping exists but no filesystem is mounted.
+    """
+    mounts = {}
+    n_volumes = 0          # VeraCrypt keeps one "fuse.veracrypt" mount each
+    try:
+        with open("/proc/self/mounts") as f:
+            for line in f:
+                parts = line.split()
+                if len(parts) >= 3 and parts[2] == "fuse.veracrypt":
+                    n_volumes += 1
+                if len(parts) >= 2 and parts[0].startswith("/dev/"):
+                    src = os.path.realpath(_unescape_mount_field(parts[0]))
+                    mounts.setdefault(src, _unescape_mount_field(parts[1]))
+    except OSError:
+        pass
+
+    # VeraCrypt creates one dm-crypt layer per cipher. A single cipher gives
+    # just "veracryptN" on the partition; a cascade stacks "veracryptN_1",
+    # "veracryptN_0", ... under the top "veracryptN", which is what gets
+    # mounted. Walk from each top layer down to the real partition.
+    dms = {}                               # "dm-3" -> (name, [slaves])
+    for dm in glob.glob("/sys/block/dm-*"):
+        try:
+            with open(os.path.join(dm, "dm", "name")) as f:
+                name = f.read().strip()
+        except OSError:
+            continue
+        try:
+            slaves = os.listdir(os.path.join(dm, "slaves"))
+        except OSError:
+            slaves = []
+        dms[os.path.basename(dm)] = (name, slaves)
+
+    def base_devices(node, depth=0):
+        if node in dms and depth < 8:
+            out = []
+            for slave in dms[node][1]:
+                out += base_devices(slave, depth + 1)
+            return out
+        return [node]
+
+    result = {}
+    n_traced = 0           # volumes followed down to a real partition
+    for node, (name, _) in dms.items():
+        if not re.fullmatch(r"veracrypt\d+", name):
+            continue                       # inner cascade layers, other dm
+        mp = mounts.get("/dev/" + node, "")
+        bases = base_devices(node)
+        for base in bases:
+            result["/dev/" + base] = mp
+        if bases and not any(b.startswith("loop") for b in bases):
+            n_traced += 1
+    if n_traced >= n_volumes:
+        return result      # the usual case: no subprocess needed
+
+    # Fallback for volumes that sysfs cannot trace to a partition (mapping
+    # on a loop device, or no kernel mapping at all with nokernelcrypto):
+    # ask veracrypt itself. Non-interactive, so it can never prompt;
+    # failures are simply ignored.
+    try:
+        r = subprocess.run(["veracrypt", "--text", "--non-interactive",
+                            "--list"], capture_output=True, text=True,
+                           timeout=5)
+        for line in r.stdout.splitlines():
+            m = re.match(r"\s*\d+:\s+(\S+)\s+\S+\s*(.*)$", line)
+            if m and m.group(1).startswith("/dev/"):
+                dev = os.path.realpath(m.group(1))
+                if dev not in result:
+                    mp = m.group(2).strip()
+                    # A lazily detached volume may still be listed with its
+                    # old folder; only trust mount points that really exist.
+                    result[dev] = mp if mp in mounts.values() else ""
+    except Exception:
+        pass
+    return result
+
+
+def harden_process():
+    """No core dumps, no memory reads by other processes of the same user."""
+    PR_SET_DUMPABLE = 4
+    try:
+        resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+        ctypes.CDLL(None).prctl(PR_SET_DUMPABLE, 0, 0, 0, 0)
+    except (OSError, ValueError, AttributeError):
+        pass                               # best effort; never block startup
+
+
+# Glyph used to mask characters in the password / PIM fields, applied via
+# GtkEntry.set_invisible_char() (first-class API, no delegate digging).
+#   "\u200B" = zero-width space: nothing is drawn and the caret does not
+#              visibly advance, so neither the characters nor the length are
+#              exposed (classic pre-sudo-rs behaviour). If any font ever renders
+#              it as a fallback box, switch to " " (a plain space): still no dots
+#              or asterisks, but the field width then hints at the length.
+MASK_CHAR = "\u200B"
+
+
+# ---------------------------------------------------------------------------
+# Autostart handling
+# ---------------------------------------------------------------------------
+def autostart_enabled():
+    return os.path.exists(AUTOSTART_FILE)
+
+
+def set_autostart(enabled):
+    if enabled:
+        python = sys.executable or shutil.which("python3") or "/usr/bin/python3"
+        script = os.path.abspath(__file__)
+        content = (
+            "[Desktop Entry]\n"
+            "Type=Application\n"
+            "Name=VeraCrypt Mounter\n"
+            "Comment=Mount VeraCrypt volumes by stable device ID\n"
+            f"Exec={python} \"{script}\" --hidden\n"
+            "Icon=drive-harddisk\n"
+            "Terminal=false\n"
+            "X-GNOME-Autostart-enabled=true\n"
+        )
+        os.makedirs(os.path.dirname(AUTOSTART_FILE), exist_ok=True)
+        with open(AUTOSTART_FILE, "w") as f:
+            f.write(content)
+        os.chmod(AUTOSTART_FILE, 0o644)
+    else:
+        try:
+            os.remove(AUTOSTART_FILE)
+        except FileNotFoundError:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# One configured volume
+# ---------------------------------------------------------------------------
+@dataclasses.dataclass
+class Volume:
+    """A configured volume and everything currently known about it."""
+    dev_id: str                      # /dev/disk/by-id/... (the stable name)
+    dev: str | None = None           # current /dev/sdXY; None = not connected
+    mountpoint: str | None = None    # None = not mounted; "" = decrypted
+                                     # device open but no filesystem mounted
+    error: str = ""                  # last mount/dismount failure (RAM only)
+    pending: str | None = None       # after a force dismount: the programs
+                                     # still holding it; None = not pending
+    st_lbl: object = None            # the row's status label
+
+    @property
+    def name(self):
+        return os.path.basename(self.dev_id)
+
+    @property
+    def mounted(self):
+        return self.mountpoint is not None
+
+    @property
+    def detached(self):
+        """Force-dismounted: folder gone, key in memory until files close."""
+        return self.mounted and self.pending is not None \
+            and not self.mountpoint
+
+    def status_text(self):
+        if self.detached:
+            return ("detached, cleanup pending until "
+                    + (f"{self.pending} closes" if self.pending
+                       else "open files are closed"))
+        if self.mounted and self.error:
+            return f"still mounted: {self.error}"   # e.g. busy on dismount
+        if self.mounted:
+            return (f"mounted ✓  {self.mountpoint}" if self.mountpoint
+                    else "not mounted, but decrypted device still open "
+                         "(key in memory)")
+        if self.dev is None:
+            return "not connected"
+        return self.error or "present"
+
+
+# ---------------------------------------------------------------------------
+# GUI
+# ---------------------------------------------------------------------------
+class VCMounter(Gtk.Application):
+    def __init__(self, start_hidden=False):
+        super().__init__(application_id="eu.arizone.vcmounter")
+        self.start_hidden = start_hidden
+        self.win = None
+        self.config_checks = []      # [(CheckButton, by_id_path)]
+        self.volumes = {}            # by_id_path -> Volume (configured ones)
+        self.busy = {}               # /dev path -> holders, after a failed
+                                     # dismount (any VeraCrypt volume)
+        self.pending_poll = 0        # GLib source id while cleanup is pending
+        self.mount_started = 0.0
+        self.mount_proc = None         # running mount helper (cancel channel)
+        self.mount_busy = False
+        self.tray_proc = None
+        self.tray_ok = False
+        self.quitting = False
+
+    # ---------- window ----------
+    def do_activate(self):
+        if self.win is not None:
+            self.win.present()
+            return
+
+        css = Gtk.CssProvider()
+        css.load_from_data(b".mono { font-family: monospace; }")
+        Gtk.StyleContext.add_provider_for_display(
+            Gtk.Widget.get_display(Gtk.Label()),
+            css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+
+        self.hold()  # stay alive while hidden in the tray
+
+        self.win = Gtk.ApplicationWindow(application=self,
+                                         title="VeraCrypt Mounter")
+        self.win.set_default_size(860, 600)
+        self.win.connect("close-request", self.on_close_request)
+
+        self.nb = Gtk.Notebook()
+        self.nb.append_page(self._build_config_tab(),
+                            Gtk.Label(label="Config"))
+        self.nb.append_page(self._build_mapping_tab(),
+                            Gtk.Label(label="Mapping"))
+        self.nb.append_page(self._build_about_tab(),
+                            Gtk.Label(label="About"))
+        self.win.set_child(self.nb)
+
+        if not self.start_hidden:
+            self.win.present()
+
+        missing = [t for t in ("veracrypt", "pkexec", "lsblk")
+                   if shutil.which(t) is None]
+        if missing:
+            self._config_status(f"Missing tools: {', '.join(missing)}")
+        elif not os.access(HELPER, os.X_OK):
+            self._config_status(
+                f"Root helper not installed ({HELPER}). "
+                "Run: sudo ./install.sh")
+
+        self.start_tray()
+        self.refresh_config_tab()
+        self.refresh_mapping_tab()
+
+    def on_close_request(self, *_):
+        if self.tray_ok:
+            self.hide_window()
+            return True          # hide to tray instead of closing
+        self.quit_app()
+        return True
+
+    def quit_app(self):
+        self.quitting = True
+        self.on_cancel_mount()          # never leave mounts running behind us
+        if self.win is not None:
+            self.wipe_secrets()
+        self.tray_send("QUIT")
+        if self.tray_proc is not None:
+            try:
+                self.tray_proc.wait(timeout=2)
+            except Exception:
+                self.tray_proc.terminate()
+        self.release()
+        self.quit()
+
+    # ---------- tray helper ----------
+    def start_tray(self):
+        if not os.path.isfile(TRAY_SCRIPT):
+            self._config_status(f"Tray unavailable ({TRAY_SCRIPT} is "
+                                "missing) — close will quit the app.")
+            return
+        try:
+            self.tray_proc = subprocess.Popen(
+                [sys.executable or "python3", "-I", TRAY_SCRIPT],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL, text=True, bufsize=1)
+        except Exception:
+            self.tray_proc = None
+            self._config_status("Tray unavailable — close will quit the app.")
+            return
+        self.tray_ok = True
+        threading.Thread(target=self._tray_reader, daemon=True).start()
+
+    def _tray_reader(self):
+        proc = self.tray_proc
+        for line in proc.stdout:
+            GLib.idle_add(self.on_tray_cmd, line.strip())
+        proc.wait()
+        GLib.idle_add(self.on_tray_exit, proc.returncode)
+
+    def on_tray_exit(self, code):
+        self.tray_ok = False
+        if self.quitting:
+            return False
+        if code == 3:
+            self._config_status(
+                "Tray icon unavailable: install "
+                "gir1.2-ayatanaappindicator3-0.1 and enable the GNOME "
+                "AppIndicator extension. Close will quit the app.")
+        else:
+            self._config_status("Tray helper exited — close will quit.")
+        if self.win is not None and not self.win.get_visible():
+            self.win.present()   # never leave the app unreachable
+        return False
+
+    def on_tray_cmd(self, cmd):
+        if cmd == "TOGGLE":
+            if self.win.get_visible():
+                self.hide_window()
+            else:
+                self.win.present()
+        elif cmd == "MOUNT":
+            self.win.present()
+            self.nb.set_current_page(1)
+            self.refresh_mapping_tab()
+            self.pw_entry.grab_focus()
+        elif cmd == "DISMOUNT":
+            self.on_dismount_all()
+        elif cmd == "QUIT":
+            self.quit_app()
+        return False
+
+    def tray_send(self, line):
+        if self.tray_proc is None or self.tray_proc.poll() is not None:
+            return
+        try:
+            self.tray_proc.stdin.write(line + "\n")
+            self.tray_proc.stdin.flush()
+        except Exception:
+            pass
+
+    # ---------- Config tab ----------
+    def _build_config_tab(self):
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6,
+                      margin_top=10, margin_bottom=10,
+                      margin_start=10, margin_end=10)
+
+        info = Gtk.Label(
+            label="Check the partitions that are VeraCrypt volumes. "
+                  "Selection is stored by stable /dev/disk/by-id path.",
+            xalign=0, wrap=True)
+        box.append(info)
+
+        self.config_list = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
+        sw = Gtk.ScrolledWindow(vexpand=True)
+        sw.set_child(self.config_list)
+        box.append(sw)
+
+        btns = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        b_refresh = Gtk.Button(label="Refresh disks")
+        b_refresh.connect("clicked", lambda *_: self.refresh_config_tab())
+        b_save = Gtk.Button(label="Save selection")
+        b_save.add_css_class("suggested-action")
+        b_save.connect("clicked", self.on_save_config)
+        btns.append(b_refresh)
+        btns.append(b_save)
+        box.append(btns)
+
+        self.autostart_check = Gtk.CheckButton(
+            label="Start at login (minimized to tray)")
+        self.autostart_check.set_active(autostart_enabled())
+        self.autostart_check.connect("toggled", self.on_autostart_toggled)
+        box.append(self.autostart_check)
+
+        self.config_status_lbl = Gtk.Label(label="", xalign=0, wrap=True)
+        box.append(self.config_status_lbl)
+        return box
+
+    def on_autostart_toggled(self, check):
+        try:
+            set_autostart(check.get_active())
+            self._config_status(
+                f"Autostart {'enabled' if check.get_active() else 'disabled'}"
+                f" ({AUTOSTART_FILE})")
+        except OSError as e:
+            self._config_status(f"Autostart change failed: {e}")
+
+    def _config_status(self, text):
+        self.config_status_lbl.set_text(text)
+
+    def refresh_config_tab(self):
+        while (row := self.config_list.get_first_child()) is not None:
+            self.config_list.remove(row)
+        self.config_checks.clear()
+
+        saved = set(load_config())
+        ids = by_id_map()
+        try:
+            parts = list_partitions()
+        except Exception as e:
+            self._config_status(f"lsblk failed: {e}")
+            return
+
+        for p in parts:
+            dev_id = ids.get(os.path.realpath(p["path"]))
+            fs = p["fstype"] or "no fs detected"
+            label = (f'{p["path"]:<16} {human_size(p["size"]):>10}   '
+                     f'{p["model"] or "-":<24} {fs:<22} '
+                     f'{os.path.basename(dev_id) if dev_id else "(no by-id!)"}')
+            check = Gtk.CheckButton(label=label)
+            check.add_css_class("mono")
+            if dev_id is None:
+                check.set_sensitive(False)
+            elif dev_id in saved:
+                check.set_active(True)
+            self.config_checks.append((check, dev_id))
+            self.config_list.append(check)
+
+        self._config_status(f"{len(parts)} partition(s) found. "
+                            f"{len(saved)} in saved config.")
+
+    def on_save_config(self, *_):
+        selected = [dev_id for check, dev_id in self.config_checks
+                    if dev_id and check.get_active()]
+        try:
+            save_config(selected)
+        except OSError as e:
+            self._config_status(f"Save failed: {e}")
+            return
+        self._config_status(f"Saved {len(selected)} volume(s) to {CONFIG_FILE}")
+        self.refresh_mapping_tab()
+
+    # ---------- About tab ----------
+    def _build_about_tab(self):
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10,
+                      margin_top=24, margin_bottom=24,
+                      margin_start=24, margin_end=24,
+                      halign=Gtk.Align.CENTER, valign=Gtk.Align.CENTER)
+        title = Gtk.Label()
+        title.set_markup("<span size='x-large' weight='bold'>"
+                         "VeraCrypt Mounter</span>")
+        box.append(title)
+        box.append(Gtk.Label(label=f"Version {__version__}"))
+        box.append(Gtk.Label(
+            label="Mounts VeraCrypt volumes in-parallel by stable device ID.",
+            wrap=True, justify=Gtk.Justification.CENTER))
+        box.append(Gtk.LinkButton(uri=PROJECT_URL, label=PROJECT_URL))
+        helper_ok = os.access(HELPER, os.X_OK)
+        box.append(Gtk.Label(
+            label=f"Root helper: {HELPER}\n"
+                  + ("installed" if helper_ok
+                     else "not installed — run: sudo ./install.sh"),
+            justify=Gtk.Justification.CENTER, selectable=True))
+        return box
+
+    # ---------- Mapping tab ----------
+    def _build_mapping_tab(self):
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6,
+                      margin_top=10, margin_bottom=10,
+                      margin_start=10, margin_end=10)
+
+        self.map_list = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
+        sw = Gtk.ScrolledWindow(vexpand=True)
+        sw.set_child(self.map_list)
+        box.append(sw)
+
+        grid = Gtk.Grid(column_spacing=8, row_spacing=8)
+
+        grid.attach(Gtk.Label(label="Password:", xalign=1), 0, 0, 1, 1)
+        self.pw_entry = self._make_secret_entry("volume password")
+        grid.attach(self.pw_entry, 1, 0, 1, 1)
+
+        grid.attach(Gtk.Label(label="PIM:", xalign=1), 0, 1, 1, 1)
+        self.pim_entry = self._make_secret_entry("empty = default")
+        grid.attach(self.pim_entry, 1, 1, 1, 1)
+
+        grid.attach(Gtk.Label(label="KDF:", xalign=1), 0, 2, 1, 1)
+        self.kdf_dd = Gtk.DropDown.new_from_strings(
+            [name for name, _ in KDF_CHOICES])
+        self.kdf_dd.set_selected(0)              # Autodetect
+        self.kdf_dd.set_hexpand(True)
+        self.kdf_dd.set_tooltip_text(KDF_TOOLTIP)
+        grid.attach(self.kdf_dd, 1, 2, 1, 1)
+        box.append(grid)
+
+        btns = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        b_refresh = Gtk.Button(label="Refresh status")
+        b_refresh.connect("clicked", lambda *_: self.refresh_mapping_tab())
+        self.mount_btn = Gtk.Button(label="Mount all configured volumes")
+        self.mount_btn.add_css_class("suggested-action")
+        self.mount_btn.connect("clicked", self.on_mount)
+        # Visible only while mounting; stops every running VeraCrypt process.
+        self.cancel_btn = Gtk.Button(label="Cancel")
+        self.cancel_btn.connect("clicked", self.on_cancel_mount)
+        self.cancel_btn.set_visible(False)
+        b_dismount = Gtk.Button(label="Dismount all")
+        b_dismount.connect("clicked", self.on_dismount_all)
+        # Shown only after a dismount left busy volumes behind.
+        self.force_btn = Gtk.Button(label="Force dismount busy…")
+        self.force_btn.add_css_class("destructive-action")
+        self.force_btn.connect("clicked", self.on_force_dismount)
+        self.force_btn.set_visible(False)
+        self.spinner = Gtk.Spinner()
+        btns.append(b_refresh)
+        btns.append(self.mount_btn)
+        btns.append(self.cancel_btn)
+        btns.append(b_dismount)
+        btns.append(self.force_btn)
+        btns.append(self.spinner)
+        box.append(btns)
+
+        self.map_status_lbl = Gtk.Label(label="", xalign=0, wrap=True)
+        box.append(self.map_status_lbl)
+        return box
+
+    # ---- secret entry fields (no visible glyph while typing) ----
+    def _make_secret_entry(self, placeholder):
+        e = Gtk.Entry(hexpand=True)
+        e.set_buffer(Gtk.PasswordEntryBuffer())   # mlock'ed, zeroed on free
+        e.set_visibility(False)            # mask + block clipboard of content
+        e.set_invisible_char(MASK_CHAR)    # our chosen glyph (0 dots by default)
+        e.set_placeholder_text(placeholder)
+        e.set_input_purpose(Gtk.InputPurpose.PASSWORD)
+        e.set_input_hints(Gtk.InputHints.PRIVATE
+                          | Gtk.InputHints.NO_SPELLCHECK
+                          | Gtk.InputHints.NO_EMOJI)
+        e.set_enable_undo(False)           # keep no editable history of the text
+        # In-field peek toggle (eye icon); starts concealed.
+        e.set_icon_from_icon_name(Gtk.EntryIconPosition.SECONDARY,
+                                  "view-reveal-symbolic")
+        e.set_icon_activatable(Gtk.EntryIconPosition.SECONDARY, True)
+        e.set_icon_tooltip_text(Gtk.EntryIconPosition.SECONDARY,
+                                "Reveal / conceal")
+        e.connect("icon-press", self._on_secret_icon)
+        return e
+
+    def _on_secret_icon(self, entry, icon_pos):
+        reveal = not entry.get_visibility()
+        entry.set_visibility(reveal)
+        entry.set_icon_from_icon_name(
+            Gtk.EntryIconPosition.SECONDARY,
+            "view-conceal-symbolic" if reveal else "view-reveal-symbolic")
+
+    def wipe_secrets(self):
+        """Clear password and PIM, reset the KDF choice, re-mask everything."""
+        for entry in (self.pw_entry, self.pim_entry):
+            entry.set_text("")             # secure buffer zeroes the old text
+            self._conceal_secret(entry)
+        self.kdf_dd.set_selected(0)        # back to Autodetect
+
+    def hide_window(self):
+        """Hide to the tray; nothing secret stays behind in a hidden window."""
+        self.wipe_secrets()
+        self.win.set_visible(False)
+
+    def _conceal_secret(self, entry):
+        entry.set_visibility(False)
+        entry.set_icon_from_icon_name(Gtk.EntryIconPosition.SECONDARY,
+                                      "view-reveal-symbolic")
+
+    def _map_status(self, text):
+        self.map_status_lbl.set_text(text)
+
+    def refresh_mapping_tab(self):
+        """Re-read the real state and rebuild the volume rows."""
+        while (row := self.map_list.get_first_child()) is not None:
+            self.map_list.remove(row)
+        active = mounted_veracrypt_devices()
+
+        # Keep known volumes (their errors survive a refresh), follow config.
+        self.volumes = {dev_id: self.volumes.get(dev_id) or Volume(dev_id)
+                        for dev_id in load_config()}
+        for vol in self.volumes.values():
+            vol.dev = (os.path.realpath(vol.dev_id)
+                       if os.path.exists(vol.dev_id) else None)
+            vol.mountpoint = active.get(vol.dev) if vol.dev else None
+            if not vol.mounted:
+                vol.pending = None                 # cleanup has finished
+            self.map_list.append(self._build_volume_row(vol))
+
+        vols = self.volumes.values()
+        n_mounted = sum(1 for v in vols if v.mounted)
+        self.tray_send(f"ICON {ICON_UNLOCKED if n_mounted else ICON_LOCKED}")
+        self._map_status(
+            f"{len(vols)} configured volume(s), "
+            f"{sum(1 for v in vols if v.dev)} connected, "
+            f"{n_mounted} mounted."
+            if vols else "No volumes configured — use the Config tab first.")
+
+    def _build_volume_row(self, vol):
+        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12,
+                      margin_top=4, margin_bottom=4,
+                      margin_start=6, margin_end=6)
+        id_lbl = Gtk.Label(label=vol.name, xalign=0, hexpand=True,
+                           ellipsize=Pango.EllipsizeMode.MIDDLE)
+        id_lbl.add_css_class("mono")
+        dev_lbl = Gtk.Label(label=vol.dev or "—", xalign=0, width_chars=14)
+        dev_lbl.add_css_class("mono")
+        vol.st_lbl = Gtk.Label(xalign=0, width_chars=34, selectable=True,
+                               ellipsize=Pango.EllipsizeMode.END)
+        self._show_status(vol)
+
+        # Per-volume dismount: a button, and the same in a right-click menu.
+        can_dismount = vol.mounted and not vol.detached
+        btn = Gtk.Button(icon_name="media-eject-symbolic")
+        btn.add_css_class("flat")
+        btn.set_tooltip_text("Dismount this volume")
+        btn.set_sensitive(can_dismount)
+        btn.connect("clicked", lambda *_: self.on_dismount_volume(vol))
+        if can_dismount:
+            # Capture phase, and claim the click in the handler: otherwise
+            # the selectable status label opens its own copy/paste menu.
+            click = Gtk.GestureClick(button=3)        # right mouse button
+            click.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+            click.connect("pressed", self._on_row_menu, row, vol)
+            row.add_controller(click)
+
+        for widget in (id_lbl, dev_lbl, vol.st_lbl, btn):
+            row.append(widget)
+        return row
+
+    def _on_row_menu(self, gesture, _n_press, x, y, row, vol):
+        gesture.set_state(Gtk.EventSequenceState.CLAIMED)
+        pop = Gtk.Popover(has_arrow=False)
+        pop.set_parent(row)
+        rect = Gdk.Rectangle()
+        rect.x, rect.y, rect.width, rect.height = int(x), int(y), 1, 1
+        pop.set_pointing_to(rect)
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+
+        def item(label, handler, sensitive=True):
+            b = Gtk.Button(label=label)
+            b.add_css_class("flat")
+            b.get_child().set_xalign(0)
+            b.set_sensitive(sensitive)
+            b.connect("clicked", lambda *_: (pop.popdown(), handler()))
+            box.append(b)
+
+        item("Dismount", lambda: self.on_dismount_volume(vol))
+        # Offered once a normal dismount found the volume busy.
+        item("Force dismount…",
+             lambda: self.on_force_dismount(devices=[vol.dev]),
+             sensitive=vol.dev in self.busy)
+        pop.set_child(box)
+        pop.connect("closed", lambda p: GLib.idle_add(p.unparent))
+        pop.popup()
+
+    @staticmethod
+    def _show_status(vol):
+        text = vol.status_text()
+        vol.st_lbl.set_text(text)
+        # Full text on hover (errors are often longer than the column).
+        vol.st_lbl.set_tooltip_text(text)
+
+    # ---------- mounting ----------
+    def on_mount(self, *_):
+        if self.mount_busy:
+            return
+        for vol in self.volumes.values():
+            vol.error = ""
+        self.refresh_mapping_tab()
+
+        targets = {v.dev: v for v in self.volumes.values()
+                   if v.dev and not v.mounted}
+        if not targets:
+            if any(v.mounted for v in self.volumes.values()):
+                self._map_status("All connected volumes are already mounted.")
+            else:
+                self._map_status("Nothing to mount: no configured volume is "
+                                 "currently connected.")
+            return
+
+        pw = self.pw_entry.get_text()
+        if not pw:
+            self._map_status("Password is empty.")
+            return
+        pim = self.pim_entry.get_text().strip()
+        if pim and not pim.isdigit():
+            self._map_status("PIM must be a positive integer (or empty).")
+            return
+        kdf = KDF_CHOICES[self.kdf_dd.get_selected()][1]
+
+        # Only device paths go on the command line (pkexec logs it and argv
+        # is world-readable). Password, PIM and KDF travel over stdin.
+        cmd = ["pkexec", HELPER, "mount"] + sorted(targets)
+
+        if not (pim and int(pim) > 0):
+            pim = ""
+        secrets_in = "\n".join((pw, pim, kdf or "")).encode("utf-8") + b"\n"
+        del pw
+
+        self.mount_busy = True
+        self.mount_btn.set_sensitive(False)
+        self.cancel_btn.set_sensitive(True)
+        self.cancel_btn.set_visible(True)
+        self.spinner.start()
+        self.mount_started = time.monotonic()
+        self._map_status("Authenticating (polkit) and mounting in parallel…")
+
+        threading.Thread(target=self._mount_worker,
+                         args=(cmd, secrets_in, targets), daemon=True).start()
+
+    def _mount_worker(self, cmd, secrets_in, targets):
+        """Background thread: run the helper, pass each result to the GUI."""
+        statuses = []
+        try:
+            proc = subprocess.Popen(cmd, stdin=subprocess.PIPE,
+                                    stdout=subprocess.PIPE,
+                                    stderr=subprocess.PIPE)
+            self.mount_proc = proc
+            # Password, PIM and KDF first (three lines); the pipe then
+            # stays open as the helper's cancel channel ("CANCEL" line, or
+            # closing when we exit).
+            proc.stdin.write(secrets_in)
+            proc.stdin.flush()
+
+            for raw in proc.stdout:
+                line = raw.decode("utf-8", "replace").rstrip("\n")
+                if not line.startswith("RESULT\t"):
+                    continue
+                _, dev, status, msg = (line.split("\t", 3) + [""])[:4]
+                statuses.append(status)
+                if dev in targets:
+                    GLib.idle_add(self._mount_result, targets[dev],
+                                  status, msg)
+
+            proc.wait()
+            stderr = proc.stderr.read().decode("utf-8", "replace").strip()
+            if proc.returncode in (126, 127):
+                summary = "Authorization cancelled or pkexec failed."
+            elif not statuses:
+                summary = f"Helper produced no results. {stderr}"
+            else:
+                ok = statuses.count("OK")
+                if "SKIPPED" in statuses:
+                    summary = ("Wrong password, PIM or KDF: stopped the "
+                               f"remaining disks. Mounted {ok}/{len(targets)}.")
+                elif "CANCELLED" in statuses:
+                    summary = f"Cancelled. Mounted {ok}/{len(targets)}."
+                else:
+                    summary = f"Mounted {ok}/{len(targets)} volume(s)."
+                if ok == len(targets):
+                    GLib.idle_add(self._mount_done, True, summary)
+                    return
+                summary += " Entries kept for retry."
+            GLib.idle_add(self._mount_done, False, summary)
+        except Exception as e:
+            GLib.idle_add(self._mount_done, False, f"Error: {e}")
+        finally:
+            proc = self.mount_proc
+            self.mount_proc = None
+            if proc is not None and proc.stdin and not proc.stdin.closed:
+                try:
+                    proc.stdin.close()
+                except OSError:
+                    pass
+
+    def on_cancel_mount(self, *_):
+        proc = self.mount_proc
+        if proc is None or proc.poll() is not None:
+            return
+        try:
+            proc.stdin.write(b"CANCEL\n")
+            proc.stdin.flush()
+        except (OSError, ValueError):
+            pass                       # helper already gone
+        self.cancel_btn.set_sensitive(False)
+        self._map_status("Cancelling…")
+
+    def _mount_result(self, vol, status, msg):
+        """One volume finished (called while the others may still run)."""
+        if status == "OK":
+            vol.error = ""
+            vol.st_lbl.set_text("mounted ✓")
+        else:
+            # Kept until the next mount attempt, so a refresh keeps showing it.
+            vol.error = (msg if status in ("CANCELLED", "SKIPPED")
+                         else f"FAILED: {msg}")
+            self._show_status(vol)
+        return False
+
+    def _mount_done(self, all_ok, summary):
+        self.mount_busy = False
+        self.mount_btn.set_sensitive(True)
+        self.cancel_btn.set_visible(False)
+        self.spinner.stop()
+        elapsed = time.monotonic() - self.mount_started
+        if all_ok:
+            self.wipe_secrets()
+            summary += " Password/PIM entries wiped."
+        # Re-read the real state (mount points, tray icon), keeping errors.
+        self.refresh_mapping_tab()
+        self._map_status(f"{summary}  ({elapsed:.1f} s)")
+        return False
+
+    # ---------- dismounting ----------
+    def on_dismount_all(self, *_):
+        self._run_dismount()
+
+    def on_dismount_volume(self, vol):
+        if vol.dev and vol.mounted:
+            self._run_dismount(devices=[vol.dev])
+
+    def on_force_dismount(self, *_, devices=None):
+        """Ask, then force-dismount the given busy volumes (default: all)."""
+        devices = [d for d in (devices or self.busy) if d in self.busy]
+        if self.mount_busy or not devices:
+            return
+        held = "; ".join(f"{d}: {self.busy[d] or 'unknown program'}"
+                         for d in devices)
+        dlg = Gtk.AlertDialog()
+        dlg.set_modal(True)
+        dlg.set_message("Force dismount busy volumes?")
+        dlg.set_detail(
+            f"Still in use — {held}\n\n"
+            "This uses VeraCrypt's Linux emergency unmount: the folder is "
+            "detached at once, but the decrypted device and its key stay in "
+            "memory until those programs close their files. Then cleanup "
+            "finishes by itself.\n\n"
+            "Programs writing to the volume at this moment may fail and "
+            "lose unsaved data. Closing them first is always safer.")
+        dlg.set_buttons(["Cancel", "Force dismount"])
+        dlg.set_cancel_button(0)
+        dlg.set_default_button(0)
+        dlg.choose(self.win, None, self._on_force_answer, devices)
+
+    def _on_force_answer(self, dlg, result, devices):
+        try:
+            choice = dlg.choose_finish(result)
+        except GLib.Error:
+            return
+        if choice == 1:
+            self._run_dismount(devices=devices, emergency=True)
+
+    def _run_dismount(self, devices=None, emergency=False):
+        """Dismount the given /dev paths, or every VeraCrypt volume."""
+        if self.mount_busy:
+            return
+        self.mount_busy = True
+        self.force_btn.set_sensitive(False)
+        self.spinner.start()
+        self._map_status("Force-dismounting busy volumes…" if emergency
+                         else "Dismounting…" if devices
+                         else "Dismounting all VeraCrypt volumes…")
+        cmd = ["pkexec", HELPER, "dismount"]
+        if emergency:
+            cmd.append("--emergency")
+        cmd += devices or []
+
+        def worker():
+            results = None     # [(volume path, status, message, holders)]
+            try:
+                r = subprocess.run(cmd, capture_output=True, text=True)
+            except Exception as e:
+                error = f"Error: {e}"
+            else:
+                if r.returncode in (126, 127):
+                    error = "Authorization cancelled or pkexec failed."
+                elif r.returncode not in (0, 1):
+                    error = f"Helper failed: {r.stderr.strip()}"
+                else:
+                    error = ""
+                    results = [
+                        tuple((line.split("\t", 4) + [""] * 4)[1:5])
+                        for line in r.stdout.splitlines()
+                        if line.startswith("DISMOUNT\t")]
+            GLib.idle_add(self._dismount_done, results, error,
+                          devices, emergency)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _dismount_done(self, results, error, devices, emergency):
+        self.mount_busy = False
+        self.spinner.stop()
+        self.force_btn.set_sensitive(True)
+        if results is None:                       # auth failed / crashed
+            self.refresh_mapping_tab()
+            self._map_status(error)
+            return False
+
+        by_dev = {v.dev: v for v in self.volumes.values() if v.dev}
+        if devices is None:                       # everything was attempted
+            self.busy = {}
+            for vol in self.volumes.values():
+                vol.error = ""
+
+        failed, detached = [], []
+        for path, status, msg, held in results:
+            dev = os.path.realpath(path)
+            vol = by_dev.get(dev)                 # None: not in our config
+            self.busy.pop(dev, None)
+            if vol:
+                vol.error = ""
+            if status == "OK" and emergency:
+                detached.append(path)
+                if vol:
+                    vol.pending = held
+            elif status == "ERR":
+                reason = f"busy, held by {held}" if held else msg
+                failed.append(f"{path}: {reason}")
+                self.busy[dev] = held
+                if vol:
+                    vol.error = reason
+
+        self.force_btn.set_visible(bool(self.busy))
+        self.refresh_mapping_tab()   # also sets the tray icon from real state
+
+        attempted = [r for r in results if r[1] != "PENDING"]
+        if emergency:
+            text = (f"Force-dismounted {len(detached)} volume(s). "
+                    "Their keys leave memory once the programs holding "
+                    "them close." if detached else "")
+            if failed:
+                text += " Failed: " + "; ".join(failed)
+        elif not attempted:
+            text = ("Nothing to dismount." if devices
+                    else "No VeraCrypt volumes were mounted.")
+        elif not failed:
+            text = (f"Dismounted {len(attempted)} volume(s)." if devices
+                    else f"Dismounted all {len(attempted)} volume(s).")
+        else:
+            text = (f"Dismounted {len(attempted) - len(failed)}/"
+                    f"{len(attempted)}. Still mounted: " + "; ".join(failed)
+                    + ". Close those programs and dismount again, "
+                      "or use Force dismount.")
+        self._map_status(text.strip())
+
+        if not self.pending_poll and any(v.detached
+                                         for v in self.volumes.values()):
+            self.pending_poll = GLib.timeout_add_seconds(3, self._poll_pending)
+        return False
+
+    def _poll_pending(self):
+        """Every 3 s while a forced cleanup is pending: has it finished?"""
+        if self.mount_busy:
+            return True
+        active = mounted_veracrypt_devices()
+        waiting = [v for v in self.volumes.values() if v.pending is not None]
+        finished = [v.name for v in waiting
+                    if not (os.path.exists(v.dev_id)
+                            and os.path.realpath(v.dev_id) in active)]
+        if finished:
+            self.refresh_mapping_tab()           # clears their pending state
+            self._map_status("Cleanup finished, key removed from memory: "
+                             + ", ".join(finished))
+        if len(finished) < len(waiting):
+            return True
+        self.pending_poll = 0
+        return False
+
+
+if __name__ == "__main__":
+    harden_process()
+    hidden = "--hidden" in sys.argv
+    raise SystemExit(VCMounter(start_hidden=hidden).run(None))

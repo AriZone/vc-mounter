@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC
+ "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
+<!-- SPDX-License-Identifier: ISC
+     Copyright (c) 2026 AriZone <github@arizone.eu> -->
+<policyconfig>
+  <vendor>vc-mounter</vendor>
+  <action id="eu.arizone.vcmounter.helper">
+    <description>Mount or dismount VeraCrypt volumes</description>
+    <message>Authentication is required to mount or dismount VeraCrypt volumes</message>
+    <icon_name>drive-harddisk</icon_name>
+    <!-- auth_admin_keep: after one authentication, the same vc-mounter
+         process may mount/dismount again without a new prompt until the
+         authorisation expires (polkit default: 5 minutes; system-wide
+         setting ExpirationSeconds in /etc/polkit-1/polkitd.conf).
+         Remote and inactive sessions are asked every time. -->
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/libexec/vc-mounter/vc-mounter-helper</annotate>
+  </action>
+</policyconfig>

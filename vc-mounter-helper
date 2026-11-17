@@ -1,0 +1,773 @@
+#!/usr/bin/python3 -I
+# SPDX-License-Identifier: ISC
+# Copyright (c) 2026 AriZone <github@arizone.eu>
+"""
+vc-mounter-helper — root-side helper of vc-mounter.
+
+Installed root-owned (see install.sh) and started only through polkit:
+
+    pkexec /usr/libexec/vc-mounter/vc-mounter-helper mount <device>...
+    pkexec /usr/libexec/vc-mounter/vc-mounter-helper dismount [<volume>...]
+    pkexec /usr/libexec/vc-mounter/vc-mounter-helper dismount --emergency <volume>...
+
+Because this file belongs to root, a program running as the desktop user
+cannot change what runs with root rights. Everything that reaches veracrypt
+from outside is validated here: devices to mount must be existing block
+devices under /dev, the PIM must be a number, the KDF one of a fixed list.
+Volumes to dismount are only ever chosen from veracrypt's own list.
+
+mount
+    Reads three lines from stdin: password, PIM, KDF (the last two may be
+    empty). They never appear on this helper's command line, which pkexec
+    writes to the system log. Mounts every device in parallel (one veracrypt
+    process per device, up to one per CPU core) and prints one tab-separated
+    line per device as each finishes:
+        RESULT \t <device> \t OK|ERR|CANCELLED|SKIPPED \t <message>
+    After the three header lines stdin stays open as a control channel: a
+    "CANCEL" line, or the pipe closing because the GUI quit or crashed,
+    stops every running mount.
+
+    Parallel safety: every device gets its own free --slot, and every
+    veracrypt process its own private TMPDIR under /run/vc-mounter. The
+    second matters because veracrypt puts a small "tracking" mount in
+    $TMPDIR/.veracrypt_aux_mntN and picks N without locking: two processes
+    starting together in the same directory can pick the same N, after
+    which one volume is mounted but no longer known to veracrypt.
+    A device that already carries a decrypted mapping is never mounted
+    again, and nothing is retried: if an attempt fails or is cancelled,
+    whatever it left behind is taken down and the error is reported.
+
+    The PIM is answered on veracrypt's stdin prompt, not passed as --pim=N:
+    veracrypt's processes keep their command line, readable by every local
+    user, for as long as a volume stays mounted.
+    Limitation: a KDF chosen explicitly is passed as --hash=NAME and so
+    stays visible in the process list. Autodetect passes nothing.
+
+dismount
+    Without arguments: every mounted VeraCrypt volume, one by one (a busy
+    volume does not stop the others). With volume paths: only those. For a
+    volume that stays mounted it lists the processes holding it. Output,
+    one line per volume:
+        DISMOUNT \t <volume> \t OK|ERR|PENDING \t <message> \t <holders>
+    Nothing is forced and nothing is killed.
+
+    A decrypted VeraCrypt mapping that veracrypt itself no longer lists
+    (its tracking mount is gone) is taken down directly: unmount the
+    filesystem, then remove the device-mapper device.
+
+    With --emergency <volume>... it runs VeraCrypt's Linux emergency unmount
+    for the listed volumes: lazy-detach the filesystem, deferred removal of
+    the dm-crypt device. The key stays in kernel memory until the programs
+    holding files release them.
+
+Requires VeraCrypt 1.26.30 or newer (reliable unmount exit status, -u).
+"""
+
+import ctypes
+import glob
+import os
+import pwd
+import re
+import resource
+import signal
+import stat
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
+
+# Fixed search path and locale: nothing here is taken from the caller.
+SAFE_PATH = "/usr/sbin:/usr/bin:/sbin:/bin"
+
+# Header KDF names accepted by `veracrypt --hash` (BLAKE2b-512 is not one:
+# it only exists as the hash inside Argon2id).
+KDF_NAMES = ("sha-512", "sha-256", "whirlpool", "blake2s-256", "streebog",
+             "argon2id")
+
+MOUNT_TIMEOUT = 600          # seconds per veracrypt mount process
+RUN_DIR = "/run/vc-mounter"  # private TMPDIRs of the veracrypt processes
+
+# Kernel interfaces (constants so tests can point them elsewhere).
+SYS_BLOCK = "/sys/block"
+SYS_CLASS_BLOCK = "/sys/class/block"
+PROC_MOUNTS = "/proc/self/mounts"
+VERACRYPT = None             # absolute path, set in main()
+VC_ENV = None                # environment for every veracrypt call
+
+
+# ---------------------------------------------------------------------------
+# Setup and validation
+# ---------------------------------------------------------------------------
+def die(msg, code=2):
+    print("vc-mounter-helper: " + msg, file=sys.stderr)
+    sys.exit(code)
+
+
+def harden_process():
+    """No core dumps of a process that holds the volume password."""
+    PR_SET_DUMPABLE = 4
+    try:
+        resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+        ctypes.CDLL(None).prctl(PR_SET_DUMPABLE, 0, 0, 0, 0)
+    except (OSError, ValueError, AttributeError):
+        pass
+
+
+def find_veracrypt():
+    for d in SAFE_PATH.split(":"):
+        p = os.path.join(d, "veracrypt")
+        if os.path.isfile(p) and os.access(p, os.X_OK):
+            return p
+    die("veracrypt not found in " + SAFE_PATH)
+
+
+def veracrypt_env():
+    # LANG / LC_ALL: English messages (wrong-password detection matches
+    # "Incorrect") and UTF-8 decoding of what veracrypt reads from stdin.
+    env = {"PATH": SAFE_PATH, "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8",
+           "HOME": "/root"}
+    # VeraCrypt gives FAT/exFAT/NTFS mounts to the user named by SUDO_UID /
+    # SUDO_GID. Set them explicitly from the user who authenticated to
+    # pkexec instead of depending on what the environment happens to hold.
+    uid = os.environ.get("PKEXEC_UID", "")
+    if uid.isdigit() and int(uid) != 0:
+        try:
+            gid = pwd.getpwuid(int(uid)).pw_gid
+        except KeyError:
+            die("PKEXEC_UID %s is not a known user" % uid)
+        env["SUDO_UID"] = uid
+        env["SUDO_GID"] = str(gid)
+    return env
+
+
+def check_devices(args):
+    """Only existing block devices under /dev; returned as real paths."""
+    if not args:
+        die("no device given")
+    devs = []
+    for a in args:
+        real = os.path.realpath(a)
+        if not a.startswith("/dev/") or not real.startswith("/dev/"):
+            die("not a device path: %r" % a)
+        try:
+            mode = os.stat(real).st_mode
+        except OSError as e:
+            die("cannot access %r: %s" % (a, e.strerror))
+        if not stat.S_ISBLK(mode):
+            die("not a block device: %r" % a)
+        if real not in devs:
+            devs.append(real)
+    return devs
+
+
+# ---------------------------------------------------------------------------
+# Shared: asking veracrypt and the kernel what is mounted
+# ---------------------------------------------------------------------------
+def veracrypt(*args, timeout=120):
+    """Run a non-interactive veracrypt command (list, unmount)."""
+    return subprocess.run([VERACRYPT, "--text", "--non-interactive", *args],
+                          capture_output=True, text=True, timeout=timeout,
+                          env=VC_ENV)
+
+
+def list_volumes():
+    """Volumes veracrypt tracks: [(slot, volume path, device, mount point)]."""
+    vols = []
+    try:
+        listing = veracrypt("--list", timeout=30).stdout
+    except (OSError, subprocess.SubprocessError):
+        return vols
+    for line in listing.splitlines():
+        m = re.match(r"\s*(\d+):\s+(\S+)\s+(\S+)\s*(.*)$", line)
+        if m:
+            # veracrypt prints "-" for a missing device or mount point.
+            device, mountpoint = m.group(3), m.group(4).strip()
+            vols.append((int(m.group(1)), m.group(2),
+                         "" if device == "-" else device,
+                         "" if mountpoint == "-" else mountpoint))
+    return vols
+
+
+def mount_table():
+    """[(source, mount point)] of every mount (octal escapes decoded)."""
+    def decode(field):
+        return re.sub(r"\\([0-7]{3})", lambda m: chr(int(m.group(1), 8)),
+                      field)
+    table = []
+    try:
+        with open(PROC_MOUNTS) as f:
+            for line in f:
+                fields = line.split()
+                if len(fields) >= 2:
+                    table.append((decode(fields[0]), decode(fields[1])))
+    except OSError:
+        pass
+    return table
+
+
+def current_mounts():
+    return {mountpoint for _, mountpoint in mount_table()}
+
+
+# ---------------------------------------------------------------------------
+# Shared: decrypted mappings as the kernel sees them
+#
+# veracrypt creates one device-mapper device per cipher: "veracryptN" on the
+# partition, or for a cascade "veracryptN" on "veracryptN_0" on ... on the
+# partition. The top one, "veracryptN", carries the filesystem.
+# ---------------------------------------------------------------------------
+def dm_devices():
+    """{"dm-3": (name, [slave kernel names])} for every dm device."""
+    devices = {}
+    for path in glob.glob(os.path.join(SYS_BLOCK, "dm-*")):
+        try:
+            with open(os.path.join(path, "dm", "name")) as f:
+                name = f.read().strip()
+            slaves = sorted(os.listdir(os.path.join(path, "slaves")))
+        except OSError:
+            continue
+        devices[os.path.basename(path)] = (name, slaves)
+    return devices
+
+
+def veracrypt_mappings(dms=None):
+    """Top-level veracrypt mappings: {"dm-3": [partition kernel names]}."""
+    dms = dm_devices() if dms is None else dms
+
+    def bases(node, depth=0):
+        if node in dms and depth < 8:
+            return [b for s in dms[node][1] for b in bases(s, depth + 1)]
+        return [node]
+
+    return {node: bases(node) for node, (name, _) in dms.items()
+            if re.fullmatch(r"veracrypt\d+", name)}
+
+
+def mappings_on(dev):
+    """dm nodes of the veracrypt mappings sitting on block device dev."""
+    kname = os.path.basename(os.path.realpath(dev))
+    return sorted(node for node, parts in veracrypt_mappings().items()
+                  if kname in parts)
+
+
+def holders_of(dev):
+    """Kernel names of whatever is stacked on block device dev (any dm)."""
+    kname = os.path.basename(os.path.realpath(dev))
+    try:
+        return sorted(os.listdir(os.path.join(SYS_CLASS_BLOCK, kname,
+                                              "holders")))
+    except OSError:
+        return []
+
+
+def run_tool(*cmd):
+    """Run umount/dmsetup; returns "" on success, else the error text."""
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=60,
+                           env=VC_ENV)
+    except (OSError, subprocess.SubprocessError) as e:
+        return str(e)
+    if r.returncode == 0:
+        return ""
+    return (r.stderr or r.stdout).strip() or "%s failed" % cmd[0]
+
+
+def take_down(node):
+    """Unmount and remove one veracrypt mapping without veracrypt's help.
+
+    For mappings veracrypt no longer tracks. Returns "" on success, else
+    why it could not be done (typically: the filesystem is busy).
+    """
+    dms = dm_devices()
+    if node not in dms:
+        return ""
+    for source, mountpoint in mount_table():
+        if os.path.realpath(source) == "/dev/" + node:
+            error = run_tool("umount", mountpoint)
+            if error:
+                return error
+    # Top layer first, then the cascade layers below it.
+    chain, todo = [], [node]
+    while todo:
+        current = todo.pop()
+        chain.append(current)
+        todo += [s for s in dms[current][1]
+                 if s in dms and dms[s][0].startswith("veracrypt")]
+    for layer in chain:
+        error = run_tool("dmsetup", "remove", dms[layer][0])
+        if error:
+            return error
+    return ""
+
+
+def release(dev):
+    """Dismount everything veracrypt-related on dev; "" or the error.
+
+    First through veracrypt for volumes it tracks, then directly for
+    mappings it does not.
+    """
+    real = os.path.realpath(dev)
+    for slot, path, _, _ in list_volumes():
+        if os.path.realpath(path) == real:
+            r = veracrypt("-u", "--slot=%d" % slot)
+            if r.returncode != 0:
+                return failure_text(r)
+    for node in mappings_on(dev):
+        error = take_down(node)
+        if error:
+            return error
+    return ""
+
+
+def failure_text(result):
+    msg = (result.stderr or result.stdout or "").strip()
+    return " | ".join(l for l in msg.splitlines() if l.strip()) or "failed"
+
+
+def private_tmpdir():
+    """A fresh directory for one veracrypt process's tracking mount."""
+    os.makedirs(RUN_DIR, mode=0o755, exist_ok=True)
+    path = tempfile.mkdtemp(prefix="aux-", dir=RUN_DIR)
+    os.chmod(path, 0o755)      # veracrypt run by the user must find it too
+    return path
+
+
+def sweep_tmpdirs():
+    """Remove private TMPDIRs whose volume is gone (rmdir never removes a
+    directory that is still a mount point or has content)."""
+    for path in glob.glob(os.path.join(RUN_DIR, "aux-*")):
+        for entry in glob.glob(os.path.join(path, ".veracrypt_aux_mnt*")):
+            try:
+                os.rmdir(entry)
+            except OSError:
+                pass
+        try:
+            os.rmdir(path)
+        except OSError:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# mount
+# ---------------------------------------------------------------------------
+class LineReader:
+    """Lines from fd 0, read raw (no Python buffering).
+
+    The first three lines are password, PIM and KDF; later lines are control
+    messages from the GUI. Raw reads also mean a "CANCEL" sent while the
+    polkit dialog was still open isn't swallowed.
+    """
+
+    def __init__(self):
+        self.buf = b""
+
+    def readline(self):
+        """Next line without its newline; None at end of input."""
+        while b"\n" not in self.buf:
+            chunk = os.read(0, 4096)
+            if not chunk:
+                line, self.buf = self.buf, b""
+                return line or None
+            self.buf += chunk
+        line, self.buf = self.buf.split(b"\n", 1)
+        return line
+
+
+def descendants(pid):
+    """All processes below pid, found via /proc (parent links)."""
+    children = {}
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        try:
+            with open("/proc/%s/stat" % entry) as f:
+                ppid = int(f.read().rsplit(")", 1)[1].split()[1])
+        except (OSError, ValueError, IndexError):
+            continue
+        children.setdefault(ppid, []).append(int(entry))
+    found, todo = [], [pid]
+    while todo:
+        for child in children.get(todo.pop(), []):
+            found.append(child)
+            todo.append(child)
+    return found
+
+
+def kill_tree(proc, sig, extra=()):
+    # veracrypt forks an internal "core service" child that does the actual
+    # mount and key derivation, so signalling only the parent is not enough.
+    # Each veracrypt runs in its own process group (start_new_session), so
+    # killpg reaches the child even after the parent is gone; the explicit
+    # descendant list covers anything that left the group.
+    try:
+        os.killpg(proc.pid, sig)
+    except OSError:
+        pass
+    for pid in list(extra) + [proc.pid]:
+        try:
+            os.kill(pid, sig)
+        except OSError:
+            pass
+
+
+class MountRun:
+    """Mounts a set of devices in parallel with one password, PIM and KDF.
+
+    Every device ends with exactly one RESULT line, printed the moment its
+    outcome is known, so the GUI shows progress while others still run.
+    """
+
+    def __init__(self, password, pim, kdf):
+        # Answers to veracrypt's prompts, in order: mount directory (empty =
+        # default /media/veracryptN), password, PIM (empty = default).
+        self.answers = b"\n" + password + b"\n" + pim.encode("ascii") + b"\n"
+        self.kdf = kdf
+        self.reported = {}                 # device -> final status
+        self.out_lock = threading.Lock()
+        # Stopping: Cancel from the GUI, GUI gone, or wrong credentials.
+        self.stopped = threading.Event()
+        self.stop_reason = "cancelled"     # or "wrong"
+        self.procs = set()                 # running veracrypt processes
+        self.procs_lock = threading.Lock()
+        self.reaped = threading.Event()    # set once stop() has killed all
+
+    def report(self, dev, status, msg):
+        with self.out_lock:
+            self.reported[dev] = status
+            print("RESULT\t%s\t%s\t%s" % (dev, status, msg), flush=True)
+
+    def stop(self, reason):
+        """Terminate every running veracrypt; later ones don't start."""
+        with self.procs_lock:
+            if self.stopped.is_set():
+                return
+            self.stop_reason = reason
+            self.stopped.set()
+            running = list(self.procs)
+        trees = [(p, descendants(p.pid)) for p in running]
+        for p, kids in trees:
+            kill_tree(p, signal.SIGTERM, kids)
+
+        def reaper():
+            time.sleep(2)
+            for p, kids in trees:
+                kill_tree(p, signal.SIGKILL, kids)
+            self.reaped.set()
+        threading.Thread(target=reaper, daemon=True).start()
+
+    def watch_gui(self, reader):
+        # The GUI keeps this pipe open while mounting. A "CANCEL" line, or the
+        # pipe closing because the GUI quit or crashed, stops every mount.
+        try:
+            while True:
+                line = reader.readline()
+                if line is None or line.strip() == b"CANCEL":
+                    break
+        except OSError:
+            pass
+        self.stop("cancelled")
+
+    def attempt(self, dev, slot):
+        """One veracrypt run. Returns (OK | ERR | STOPPED, message)."""
+        if self.stopped.is_set():
+            return "STOPPED", ""
+        # Interactive text mode on purpose: veracrypt then asks for the mount
+        # directory, the password and the PIM on stdin, so the PIM never
+        # appears on a command line. --keyfiles= and --protect-hidden=no
+        # suppress the remaining prompts.
+        cmd = [VERACRYPT, "--text", "--protect-hidden=no", "--keyfiles="]
+        if self.kdf:
+            cmd.append("--hash=" + self.kdf)
+        if slot is not None:
+            cmd.append("--slot=%d" % slot)
+        cmd += ["--mount", dev]
+        try:
+            # A TMPDIR of its own: see "Parallel safety" at the top.
+            env = dict(VC_ENV, TMPDIR=private_tmpdir())
+            p = subprocess.Popen(cmd, stdin=subprocess.PIPE,
+                                 stdout=subprocess.PIPE,
+                                 stderr=subprocess.PIPE,
+                                 start_new_session=True, env=env)
+        except OSError as e:
+            return "ERR", str(e)
+        with self.procs_lock:
+            self.procs.add(p)
+            late = self.stopped.is_set()   # stopped while we were starting it
+        if late:
+            kill_tree(p, signal.SIGKILL, descendants(p.pid))
+        try:
+            out, err = p.communicate(self.answers, timeout=MOUNT_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            kill_tree(p, signal.SIGKILL, descendants(p.pid))
+            p.communicate()
+            return "ERR", "timed out after %d minutes" % (MOUNT_TIMEOUT // 60)
+        finally:
+            with self.procs_lock:
+                self.procs.discard(p)
+        if p.returncode == 0:
+            return "OK", "mounted"         # finished before a stop arrived
+        if self.stopped.is_set():
+            return "STOPPED", ""
+        # Errors arrive on stdout between the prompts; drop the prompt lines.
+        text = (out + b"\n" + err).decode("utf-8", "replace")
+        msg = " | ".join(line.strip() for line in text.splitlines()
+                         if line.strip() and not line.startswith("Enter "))
+        return "ERR", msg or "veracrypt failed"
+
+    def mount_device(self, dev, slot):
+        """Mount one device and print its RESULT line."""
+        stacked = holders_of(dev)
+        if stacked:
+            # Mounting it again would put two filesystem drivers on one
+            # volume. Never do that, whatever veracrypt's own list says.
+            self.report(dev, "ERR", "already decrypted or in use (%s): not "
+                        "mounting it a second time. Dismount it first."
+                        % ", ".join(stacked))
+            return
+
+        status, msg = self.attempt(dev, slot)
+        if status == "OK":
+            self.report(dev, "OK", msg)
+            return
+        if status == "ERR" and "ncorrect" in msg:
+            # All disks share the credentials: no point letting the rest burn
+            # CPU for minutes. Report this one now, stop the others.
+            # (veracrypt's own text is a six-line list of possible causes.)
+            self.report(dev, "ERR", "wrong password, PIM or KDF "
+                                    "(or not a VeraCrypt volume)")
+            self.stop("wrong")
+            return
+
+        # Failed or interrupted part-way. veracrypt may already have
+        # decrypted the volume, with or without still tracking it: take that
+        # down, so the device is never left half-mounted. No retry.
+        if status == "STOPPED":
+            self.reaped.wait(5)            # until the processes are gone
+        note = ""
+        if mappings_on(dev) or any(os.path.realpath(path) == dev
+                                   for _, path, _, _ in list_volumes()):
+            error = release(dev)
+            note = (" | it had left the volume decrypted: cleaned up"
+                    if not error else
+                    " | it left the volume decrypted and cleaning up failed "
+                    "(%s): dismount it before mounting again" % error)
+        if status == "ERR":
+            self.report(dev, "ERR", msg + note)
+        elif self.stop_reason == "wrong":
+            self.report(dev, "SKIPPED",
+                        "stopped: wrong password, PIM or KDF" + note)
+        else:
+            self.report(dev, "CANCELLED", "cancelled" + note)
+
+    def run(self, devs):
+        """Mount all devices; returns the process exit code."""
+        # A device veracrypt lists but the kernel has no mapping for is a
+        # stale leftover (e.g. of a killed mount). veracrypt would answer
+        # "already mounted"; let it drop the entry first.
+        for slot, path, _, _ in list_volumes():
+            real = os.path.realpath(path)
+            if real in devs and not holders_of(real):
+                veracrypt("-u", "--slot=%d" % slot)
+        sweep_tmpdirs()
+        # Each device gets its own free slot (VeraCrypt slots are 1..64), so
+        # parallel instances never compete for the same
+        # /dev/mapper/veracryptN or /media/veracryptN.
+        used = {slot for slot, _, _, _ in list_volumes()}
+        free = [s for s in range(1, 65) if s not in used]
+        slots = (free + [None] * len(devs))[:len(devs)]
+
+        workers = max(1, min(len(devs), os.cpu_count() or 1))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            list(pool.map(self.mount_device, devs, slots))
+        return 0 if all(s == "OK" for s in self.reported.values()) else 1
+
+
+def mount_main(devs):
+    reader = LineReader()
+    password = reader.readline() or b""
+    pim = (reader.readline() or b"").decode("ascii", "replace").strip()
+    kdf = (reader.readline() or b"").decode("ascii", "replace").strip()
+    if pim and not pim.isdigit():
+        die("bad PIM")
+    if kdf and kdf not in KDF_NAMES:
+        die("bad KDF")
+
+    run = MountRun(password, pim, kdf)
+    threading.Thread(target=run.watch_gui, args=(reader,),
+                     daemon=True).start()
+    rc = run.run(devs)
+    sys.stdout.flush()
+    os._exit(rc)    # don't wait for the stdin-watcher thread at shutdown
+
+
+# ---------------------------------------------------------------------------
+# dismount
+# ---------------------------------------------------------------------------
+def holders(mountpoint):
+    """Who keeps a mounted filesystem busy, as readable text.
+
+    Compares the filesystem's device number with each process's cwd, root,
+    executable, open files and memory-mapped files.
+    """
+    if not mountpoint:
+        return ""
+    try:
+        dev = os.stat(mountpoint).st_dev
+    except OSError:
+        return ""
+    major, minor = os.major(dev), os.minor(dev)
+
+    def on_volume(path):
+        try:
+            return os.stat(path).st_dev == dev
+        except OSError:
+            return False
+
+    def uses_volume(base):
+        if any(on_volume(base + link) for link in ("cwd", "root", "exe")):
+            return True
+        try:
+            if any(on_volume(base + "fd/" + fd)
+                   for fd in os.listdir(base + "fd")):
+                return True
+        except OSError:
+            pass
+        try:
+            with open(base + "maps") as f:
+                for line in f:
+                    p = line.split()
+                    if len(p) >= 6 and ":" in p[3] and p[4] != "0":
+                        a, b = p[3].split(":")
+                        if int(a, 16) == major and int(b, 16) == minor:
+                            return True
+        except (OSError, ValueError):
+            pass
+        return False
+
+    found = {}
+    for pid in os.listdir("/proc"):
+        if not pid.isdigit() or int(pid) == os.getpid():
+            continue
+        base = "/proc/" + pid + "/"
+        if uses_volume(base):
+            try:
+                with open(base + "comm") as f:
+                    found[int(pid)] = f.read().strip()
+            except OSError:
+                found[int(pid)] = "?"
+    parts = ["%s (%d)" % (name, pid) for pid, name in sorted(found.items())]
+    # Filesystems mounted inside this one also keep it busy.
+    inside = mountpoint.rstrip("/") + "/"
+    parts += ["mount at " + m for m in sorted(current_mounts())
+              if m.startswith(inside)]
+    if len(parts) > 6:
+        parts = parts[:6] + ["+%d more" % (len(parts) - 6)]
+    return ", ".join(parts)
+
+
+def dismount_main(args):
+    emergency = args[:1] == ["--emergency"]
+    if emergency:
+        args = args[1:]
+    for a in args:
+        if not a.startswith("/"):
+            die("not a volume path: %r" % a)
+    # The arguments only select among the volumes veracrypt itself lists.
+    wanted = {os.path.realpath(a) for a in args}
+    if emergency and not wanted:
+        die("--emergency needs at least one volume path")
+
+    def result(path, status, msg, held=""):
+        print("DISMOUNT\t%s\t%s\t%s\t%s" % (path, status, msg, held),
+              flush=True)
+
+    rc = 0
+    # Several passes: dismounting one volume can make veracrypt list another
+    # that was hidden behind it (two tracking mounts on the same folder).
+    seen = set()
+    for _ in range(4):
+        todo = [v for v in list_volumes()
+                if v[:2] not in seen
+                and (not wanted or os.path.realpath(v[1]) in wanted)]
+        if not todo:
+            break
+        for slot, path, device, mountpoint in dict.fromkeys(todo):
+            seen.add((slot, path))
+            mounted = bool(mountpoint) and mountpoint in current_mounts()
+            held = holders(mountpoint) if mounted else ""
+            args = ["-u", "--slot=%d" % slot]
+            if emergency:
+                args.append("--emergency-unmount")
+            r = veracrypt(*args)
+            if r.returncode == 0:
+                result(path, "OK", "detached (emergency)" if emergency
+                       else "dismounted", held if emergency else "")
+            elif not mounted and device and os.path.exists(device):
+                # Detached by an earlier emergency dismount: the kernel
+                # removes the device once its last user is gone.
+                result(path, "PENDING", "cleanup pending")
+            else:
+                rc = 1
+                msg = failure_text(r)
+                if emergency and ("command line" in msg.lower()
+                                  or "unknown option" in msg.lower()):
+                    msg = ("this VeraCrypt has no --emergency-unmount "
+                           "(needs 1.26.29 or newer)")
+                result(path, "ERR", msg, held)
+
+    # dm nodes of the volumes veracrypt still lists (busy or pending ones).
+    tracked = {os.path.basename(os.path.realpath(device))
+               for _, _, device, _ in list_volumes() if device}
+
+    # Decrypted mappings veracrypt does not list (their tracking mount is
+    # gone): take them down directly. Never by force.
+    for node, parts in sorted(veracrypt_mappings().items()):
+        devices = ["/dev/" + part for part in parts]
+        if node in tracked or (wanted and not wanted & set(devices)):
+            continue
+        path = devices[0] if devices else "/dev/" + node
+        mounted_at = [m for src, m in mount_table()
+                      if os.path.realpath(src) == "/dev/" + node]
+        if emergency:
+            rc = 1
+            result(path, "ERR", "not tracked by VeraCrypt: it cannot be "
+                   "force-dismounted; close the programs using it and "
+                   "dismount normally")
+            continue
+        held = holders(mounted_at[0]) if mounted_at else ""
+        error = take_down(node)
+        if not error:
+            result(path, "OK", "dismounted (VeraCrypt had lost track of it)")
+        elif not mounted_at:
+            # No filesystem on it any more: an earlier emergency dismount
+            # that the kernel completes once the last user is gone.
+            result(path, "PENDING", "cleanup pending")
+        else:
+            rc = 1
+            result(path, "ERR", error, held)
+    sweep_tmpdirs()
+    sys.exit(rc)
+
+
+# ---------------------------------------------------------------------------
+def main():
+    if os.geteuid() != 0:
+        die("must be run as root through pkexec")
+    if len(sys.argv) < 2 or sys.argv[1] not in ("mount", "dismount"):
+        die("usage: vc-mounter-helper mount <device>... | "
+            "dismount [--emergency] [<volume>...]")
+    harden_process()
+    global VERACRYPT, VC_ENV
+    VERACRYPT = find_veracrypt()
+    VC_ENV = veracrypt_env()
+    os.chdir("/")
+    if sys.argv[1] == "mount":
+        mount_main(check_devices(sys.argv[2:]))
+    else:
+        dismount_main(sys.argv[2:])
+
+
+if __name__ == "__main__":
+    main()

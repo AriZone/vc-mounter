@@ -1,0 +1,66 @@
+#!/usr/bin/python3 -I
+# SPDX-License-Identifier: ISC
+# Copyright (c) 2026 AriZone <github@arizone.eu>
+"""
+vc-mounter-tray — tray indicator of vc-mounter (GTK3 + AppIndicator).
+
+Started by vc-mounter as a subprocess; not meant to be run by hand.
+It only shows the icon and menu and holds nothing secret.
+
+Line protocol:
+    tray -> app  (stdout):  TOGGLE | MOUNT | DISMOUNT | QUIT
+    app -> tray  (stdin):   ICON <icon-name> | QUIT
+
+Exits with code 3 if no AppIndicator library is available
+(sudo apt install gir1.2-ayatanaappindicator3-0.1).
+"""
+import sys, threading
+import gi
+gi.require_version("Gtk", "3.0")
+
+Ind = None
+for ns in ("AyatanaAppIndicator3", "AppIndicator3"):
+    try:
+        gi.require_version(ns, "0.1")
+        mod = __import__("gi.repository", fromlist=[ns])
+        Ind = getattr(mod, ns)
+        break
+    except Exception:
+        continue
+if Ind is None:
+    sys.exit(3)
+
+from gi.repository import Gtk, GLib
+
+ind = Ind.Indicator.new("vc-mounter", "changes-prevent-symbolic",
+                        Ind.IndicatorCategory.APPLICATION_STATUS)
+ind.set_status(Ind.IndicatorStatus.ACTIVE)
+ind.set_title("VeraCrypt Mounter")
+
+menu = Gtk.Menu()
+
+def add(label, cmd):
+    mi = Gtk.MenuItem(label=label)
+    mi.connect("activate", lambda *_: print(cmd, flush=True))
+    menu.append(mi)
+
+add("Show / hide window", "TOGGLE")
+add("Mount volumes\u2026", "MOUNT")
+add("Dismount all", "DISMOUNT")
+menu.append(Gtk.SeparatorMenuItem())
+add("Quit", "QUIT")
+menu.show_all()
+ind.set_menu(menu)
+
+def reader():
+    for line in sys.stdin:
+        line = line.strip()
+        if line.startswith("ICON "):
+            name = line[5:]
+            GLib.idle_add(ind.set_icon_full, name, "VeraCrypt Mounter")
+        elif line == "QUIT":
+            GLib.idle_add(Gtk.main_quit)
+    GLib.idle_add(Gtk.main_quit)
+
+threading.Thread(target=reader, daemon=True).start()
+Gtk.main()
